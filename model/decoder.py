@@ -1,3 +1,4 @@
+import math
 from .layers.transformer import *
 from .layers.improved_transformer import *
 import torch.nn as nn
@@ -30,7 +31,8 @@ LOOP_END_P = [LOOP_END, LOOP_END]
 FACE_END_P = [FACE_END, FACE_END]
 
 # FIGR-SVG-svgo
-BBOX = 200
+BBOX = 200 # discrete coordinate
+XYCOORD = 2 # continuous coordinate
 
 def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
     """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
@@ -89,6 +91,33 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class PositionalEncodingRFF(nn.Module):
+    def __init__(self, d_model, d_input=2, std_dev=2.0):
+        super(PositionalEncodingRFF, self).__init__()
+        frequency_matrix = torch.normal(mean=torch.zeros(d_input, d_model//2),
+                                        std=std_dev)        
+        self.register_buffer('frequency_matrix', frequency_matrix)
+
+    def forward(self, coordinates):
+        """Creates Fourier features from coordinates.
+
+        Args:
+            coordinates (torch.Tensor): Shape (num_points, coordinate_dim)
+        """
+        # The coordinates variable contains a batch of vectors of dimension
+        # coordinate_dim. We want to perform a matrix multiply of each of these
+        # vectors with the frequency matrix. I.e. given coordinates of
+        # shape (num_points, coordinate_dim) we perform a matrix multiply by
+        # the transposed frequency matrix of shape (coordinate_dim, num_frequencies)
+        # to obtain an output of shape (num_points, num_frequencies).
+        prefeatures = torch.matmul(coordinates, self.frequency_matrix)
+        # Calculate cosine and sine features
+        cos_features = torch.cos(2 * math.pi * prefeatures)
+        sin_features = torch.sin(2 * math.pi * prefeatures)
+        # Concatenate sine and cosine features
+        return torch.cat((cos_features, sin_features), dim=-1)  
+    
+
 class SketchDecoder(nn.Module):
   """
   Autoregressive generative model 
@@ -110,7 +139,11 @@ class SketchDecoder(nn.Module):
 
     self.text_len = text_len
     self.num_text_token = num_text_token
+
+    self.embed_type = config['embedding']
+    self.pred_type = config['prediction']
     self.num_image_token = BBOX * BBOX + PIX_PAD + SVG_END
+
     self.total_token = num_text_token + self.num_image_token
     self.total_seq_len = text_len + pix_len
     self.loss_img_weight = 7
@@ -128,8 +161,13 @@ class SketchDecoder(nn.Module):
 
     self.register_buffer('logits_mask', logits_mask, persistent=False)
     # Sketch encoders
-    self.coord_embed_x = Embedder(BBOX+COORD_PAD+SVG_END, self.embed_dim, padding_idx=MASK)
-    self.coord_embed_y = Embedder(BBOX+COORD_PAD+SVG_END, self.embed_dim, padding_idx=MASK)
+    if self.embed_type == 'iconshop':
+      self.coord_embed_x = Embedder(BBOX+COORD_PAD+SVG_END, self.embed_dim, padding_idx=MASK)
+      self.coord_embed_y = Embedder(BBOX+COORD_PAD+SVG_END, self.embed_dim, padding_idx=MASK)
+    elif 'rff' in self.embed_type:
+      rff_std = float(config['embedding'].split('rff')[1])
+      self.coord_embed = PositionalEncodingRFF(self.embed_dim, d_input=1, std_dev=rff_std)
+      self.xy_embed = nn.Linear(self.embed_dim * 2, self.embed_dim)
 
     self.pixel_embed = Embedder(self.num_image_token, self.embed_dim, padding_idx=MASK)
     self.pos_embed = PositionalEncoding(max_len=self.total_seq_len, d_model=self.embed_dim)
@@ -151,7 +189,7 @@ class SketchDecoder(nn.Module):
   def forward(self, pix, xy, mask, text, return_loss=False):
     '''
     pix.shape  [batch_size, max_len]
-    xy.shape   [batch_size, max_len, 2]
+    xy.shape   [batch_size, max_len, 2]_
     mask.shape [batch_size, max_len]
     text.shape [batch_size, text_len]
     '''
@@ -171,10 +209,17 @@ class SketchDecoder(nn.Module):
 
     # Data input embedding
     if pixel_v[0] is not None:
+      
+      if self.embed_type == 'iconshop':
       # coord_embed.shape [batch_size, max_len-1, emb_dim]
       # pixel_embed.shape [batch_size, max_len-1, emb_dim] 
-      coord_embed = self.coord_embed_x(xy_v[...,0]) + self.coord_embed_y(xy_v[...,1]) # [bs, vlen, dim]
+        coord_embed = self.coord_embed_x(xy_v[...,0]) + self.coord_embed_y(xy_v[...,1]) # [bs, vlen, dim]
+      elif 'rff' in self.embed_type:
+        coord_embed = self.coord_embed(xy_v.unsqueeze(3).float())
+        coord_embed = self.xy_embed(coord_embed.view(xy_v.size(0), xy_v.size(1), -1))
+
       pixel_embed = self.pixel_embed(pixel_v)
+
       embed_inputs = pixel_embed + coord_embed
 
       # tokens.shape [batch_size, text_len+max_len-1, emb_dim]
@@ -209,11 +254,26 @@ class SketchDecoder(nn.Module):
 
       pix_logits = rearrange(pix_logits, 'b c n -> (b n) c')
       pix_mask = ~mask.reshape(-1)
-      pix_target = pix.reshape(-1) + self.num_text_token
+      
 
       text_loss = F.cross_entropy(text_logits, text)
-      pix_loss = F.cross_entropy(pix_logits[pix_mask], pix_target[pix_mask], ignore_index=MASK+self.num_text_token)
+
+      if self.pred_type == 'iconshop':
+        pix_target = pix.reshape(-1) + self.num_text_token
+        pix_loss = F.cross_entropy(pix_logits[pix_mask], pix_target[pix_mask], ignore_index=MASK+self.num_text_token)
+        
+      elif self.pred_type == 'conv':
+        import pdb; pdb.set_trace()
+        pix_target = pix_target.reshape(-1) + self.num_text_token
+
+        xy_logits, cmd_logits = pix_logits[...,0:2], pix_logits[...,2:]
+        
+        cmd_loss = F.cross_entropy(cmd_logits[pix_mask], pix_target[pix_mask], ignore_index=MASK+self.num_text_token)
+        xy_loss = F.l1_loss(xy_logits.view(xy.size()), xy)  # shift due to -1 PAD_VAL
+        pix_loss = (0.33334 * cmd_loss + 0.66666 * xy_loss)
+        
       loss = (text_loss + self.loss_img_weight * pix_loss) / (self.loss_img_weight + 1)
+
       return loss, pix_loss, text_loss
     else:
       return logits

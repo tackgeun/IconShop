@@ -43,6 +43,8 @@ def train(args, cfg):
             'num_layers': cfg['num_layers'], 
             'num_heads': cfg['num_heads'],
             'dropout_rate': cfg['dropout_rate'],
+            'embedding': args.embedding,
+            'prediction': args.prediction,
         },
         pix_len=train_dataset.maxlen_pix,
         text_len=cfg['text_len'],
@@ -167,6 +169,9 @@ if __name__ == "__main__":
     parser.add_argument("--batchsize", type=int, required=True)
     parser.add_argument("--maxlen", type=int, required=True)
     parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--embedding", type=str, default='iconshop')
+    parser.add_argument("--prediction", type=str, default='iconshop')
+
     args = parser.parse_args()
 
     config = {
@@ -193,7 +198,7 @@ if __name__ == "__main__":
         'batch_size': args.batchsize,
         'max_len': args.maxlen,
     }
-
+    
     # Create training folder
     result_folder = os.path.join(args.output_dir, args.project_name)
     if not os.path.exists(result_folder):
